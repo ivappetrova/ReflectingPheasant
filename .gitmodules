@@ -1,0 +1,3 @@
+[submodule "external/FlyFish"]
+	path = external/FlyFish
+	url = https://github.com/fdlombae/FlyFish.git

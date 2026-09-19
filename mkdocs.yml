@@ -1,0 +1,66 @@
+site_name: FlyTracer
+site_description: Vulkan Compute Shader Raytracer Documentation
+site_url: https://fdlombae.github.io/FlyTracer/
+repo_url: https://github.com/fdlombae/FlyTracer
+repo_name: fdlombae/FlyTracer
+use_directory_urls: false
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - toc.integrate
+    - content.code.copy
+    - content.code.annotate
+    - search.highlight
+    - search.suggest
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - def_list
+  - toc:
+      permalink: true
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Creating Scenes:
+    - scenes/index.md
+    - Overview: scenes/overview.md
+    - Primitives: scenes/primitives.md
+    - Materials: scenes/materials.md
+    - Meshes: scenes/meshes.md
+    - Lighting: scenes/lighting.md
+    - Camera: scenes/camera.md
+    - Animation: scenes/animation.md
+    - Input Handling: scenes/input.md
+    - Debug UI: scenes/imgui.md
+    - Debug Visualization: scenes/debug.md
+  - PGA Basics: pga.md

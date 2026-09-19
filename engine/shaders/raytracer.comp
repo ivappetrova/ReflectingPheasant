@@ -1,0 +1,578 @@
+#version 450
+
+// Raytracer compute shader - Multi-bounce path tracing
+// Clean, unified implementation with minimal code duplication
+
+#include "common.glsl"
+#include "intersections.glsl"
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (binding = 0, rgba8) uniform writeonly image2D outputImage;
+
+// Scene buffers
+layout (binding = 1) readonly buffer VertexBuffer { Vertex vertices[]; };
+layout (binding = 2) readonly buffer IndexBuffer { Triangle triangles[]; };
+layout (binding = 3) readonly buffer SphereBuffer { Sphere spheres[]; };
+layout (binding = 4) readonly buffer PlaneBuffer { Plane planes[]; };
+layout (binding = 5) readonly buffer LightBuffer { Light lights[]; };
+layout (binding = 6) readonly buffer MaterialBuffer { Material materials[]; };
+layout (binding = 7) readonly buffer BVHNodeBuffer { BVHNode bvhNodes[]; };
+layout (binding = 8) readonly buffer BVHTriIdxBuffer { uint bvhTriIndices[]; };
+layout (binding = 9) readonly buffer TextureBuffer { vec4 textureData[]; };
+layout (binding = 10) readonly buffer InstanceBuffer { MeshInstance instances[]; };
+layout (binding = 11) readonly buffer MeshInfoBuffer { MeshInfo meshInfos[]; };
+layout (binding = 12) readonly buffer TextureInfoBuffer { TextureInfo textureInfos[]; };
+
+layout (push_constant) uniform PushConstants {
+    float time;
+    uint triangleCount;
+    uint sphereCount;
+    uint planeCount;
+    uint lightCount;
+    uint materialCount;
+    uint instanceCount;
+    float planeTileScale;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 cameraForward;
+    vec3 cameraPosition;
+    float cameraFov;
+    uint textureWidth;
+    uint textureHeight;
+    uint maxBounces;
+} pc;
+
+// ==================== Helper Structures ====================
+
+// Light sample - computed properties for a light source at a given point
+struct LightSample {
+    vec3 direction;     // Direction toward light
+    vec3 color;         // Light color * intensity
+    float attenuation;  // Distance/spot attenuation
+    float maxDist;      // Max distance for shadow ray
+    bool valid;         // Whether this light contributes
+};
+
+// Surface properties for path tracing
+struct SurfaceInfo {
+    vec3 albedo;
+    float metallic;
+    float roughness;
+    float reflectivity;
+    int shadingMode;
+    int skipInstance;
+};
+
+// ==================== Camera ====================
+
+Ray generateCameraRay(ivec2 pixel, ivec2 dims) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(dims);
+    vec2 ndc = uv * 2.0 - 1.0;
+    float aspect = float(dims.x) / float(dims.y);
+    float fovScale = tan(pc.cameraFov * PI / 360.0);
+
+    vec3 localDir = normalize(vec3(ndc.x * aspect * fovScale, -ndc.y * fovScale, -1.0));
+    vec3 worldDir = localDir.x * pc.cameraRight.xyz
+                  + localDir.y * pc.cameraUp.xyz
+                  + localDir.z * pc.cameraForward.xyz;
+
+    Ray ray;
+    ray.origin = pc.cameraPosition;
+    ray.direction = normalize(worldDir);
+    return ray;
+}
+
+// ==================== BVH Traversal (Unified) ====================
+
+// Transform ray to object space - returns scale factor for t conversion
+// localT * dirScale = worldT (approximately, for uniform scale)
+float transformRayToObjectSpace(Ray worldRay, mat4 invTransform, out Ray localRay) {
+    localRay.origin = (invTransform * vec4(worldRay.origin, 1.0)).xyz;
+    vec3 localDir = (invTransform * vec4(worldRay.direction, 0.0)).xyz;
+    float dirScale = length(localDir);  // How much the direction got scaled
+    localRay.direction = localDir / dirScale;  // Normalize for intersection tests
+    return dirScale;  // Multiply local t by this to get world t
+}
+
+// BVH traversal - finds closest hit and fills in HitInfo
+// dirScale: factor to convert local t to world t (local_t / dirScale = world_t)
+// meshId: which mesh's BVH to traverse (used to get root node offset)
+// Returns true if any triangle was hit
+bool traverseBVH(Ray localRay, float dirScale, inout HitInfo hit, uint instIdx, mat4 transform, mat4 invTransform, uint meshId) {
+    bool anyHit = false;
+    int stack[32];
+    int stackPtr = 0;
+    // Start at the root node for this mesh
+    int rootNode = int(meshInfos[meshId].bvhNodeOffset);
+    stack[stackPtr++] = rootNode;
+
+    // Convert world-space t threshold to local-space for comparisons
+    float localMaxT = hit.t * dirScale;
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        BVHNode node = bvhNodes[nodeIdx];
+
+        if (!intersectAABB(localRay, node.minBounds, node.maxBounds, localMaxT)) continue;
+
+        if (node.triCount > 0) {
+            // Leaf node
+            for (int i = 0; i < node.triCount; i++) {
+                uint triIdx = bvhTriIndices[node.leftFirst + i];
+                Triangle tri = triangles[triIdx];
+                vec3 v0 = getVertexPosition(vertices[tri.indices[0]]);
+                vec3 v1 = getVertexPosition(vertices[tri.indices[1]]);
+                vec3 v2 = getVertexPosition(vertices[tri.indices[2]]);
+
+                float t = localMaxT;
+                vec3 bary;
+                if (intersectTriangle(localRay, v0, v1, v2, t, bary)) {
+                    anyHit = true;
+                    localMaxT = t;  // Update local threshold
+                    hit.hit = true;
+                    hit.t = t / dirScale;  // Convert back to world-space t
+                    vec3 localPos = localRay.origin + t * localRay.direction;
+                    hit.position = (transform * vec4(localPos, 1.0)).xyz;
+
+                    vec3 n0 = getVertexNormal(vertices[tri.indices[0]]);
+                    vec3 n1 = getVertexNormal(vertices[tri.indices[1]]);
+                    vec3 n2 = getVertexNormal(vertices[tri.indices[2]]);
+                    vec3 localNormal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
+
+                    // Ensure normal faces toward the incoming ray (double-sided rendering)
+                    // This handles meshes with inconsistent winding or inward-facing normals
+                    if (dot(localNormal, localRay.direction) > 0.0) {
+                        localNormal = -localNormal;
+                    }
+
+                    hit.normal = normalize((transpose(invTransform) * vec4(localNormal, 0.0)).xyz);
+
+                    vec2 uv0 = getVertexTexCoord(vertices[tri.indices[0]]);
+                    vec2 uv1 = getVertexTexCoord(vertices[tri.indices[1]]);
+                    vec2 uv2 = getVertexTexCoord(vertices[tri.indices[2]]);
+                    hit.uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+
+                    hit.primitiveType = PRIMITIVE_TRIANGLE;
+                    hit.triangleIndex = triIdx;
+                    hit.materialIndex = tri.materialIndex;
+                    hit.instanceIndex = instIdx;
+                }
+            }
+        } else if (stackPtr < 31) {
+            stack[stackPtr++] = node.leftFirst + 1;
+            stack[stackPtr++] = node.leftFirst;
+        }
+    }
+    return anyHit;
+}
+
+// BVH any-hit query - returns true as soon as any intersection is found (for shadows)
+// meshId: which mesh's BVH to traverse (used to get root node offset)
+bool traverseBVHAnyHit(Ray localRay, float maxDist, uint meshId) {
+    int stack[16];
+    int stackPtr = 0;
+    // Start at the root node for this mesh
+    int rootNode = int(meshInfos[meshId].bvhNodeOffset);
+    stack[stackPtr++] = rootNode;
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        BVHNode node = bvhNodes[nodeIdx];
+
+        if (!intersectAABB(localRay, node.minBounds, node.maxBounds, maxDist)) continue;
+
+        if (node.triCount > 0) {
+            for (int i = 0; i < node.triCount; i++) {
+                uint triIdx = bvhTriIndices[node.leftFirst + i];
+                Triangle tri = triangles[triIdx];
+                vec3 v0 = getVertexPosition(vertices[tri.indices[0]]);
+                vec3 v1 = getVertexPosition(vertices[tri.indices[1]]);
+                vec3 v2 = getVertexPosition(vertices[tri.indices[2]]);
+
+                float t = maxDist;
+                vec3 bary;
+                if (intersectTriangle(localRay, v0, v1, v2, t, bary)) {
+                    return true;  // Early exit on any hit
+                }
+            }
+        } else if (stackPtr < 15) {
+            stack[stackPtr++] = node.leftFirst + 1;
+            stack[stackPtr++] = node.leftFirst;
+        }
+    }
+    return false;
+}
+
+// ==================== Scene Tracing ====================
+
+// Full scene trace - finds closest hit across all primitives
+HitInfo traceScene(Ray ray) {
+    HitInfo hit;
+    hit.hit = false;
+    hit.t = MAX_DIST;
+    hit.instanceIndex = 0;
+
+    // Spheres
+    for (uint i = 0; i < pc.sphereCount; i++) {
+        Sphere s = spheres[i];
+        vec3 center = vec3(s.center_x, s.center_y, s.center_z);
+        float t = hit.t;
+        if (intersectSphere(ray, center, s.radius, t)) {
+            hit.hit = true;
+            hit.t = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = normalize(hit.position - center);
+            hit.primitiveType = PRIMITIVE_SPHERE;
+            hit.materialIndex = i;
+        }
+    }
+
+    // Planes
+    for (uint i = 0; i < pc.planeCount; i++) {
+        Plane p = planes[i];
+        vec3 normal = vec3(p.normal_x, p.normal_y, p.normal_z);
+        float t = hit.t;
+        if (intersectPlane(ray, normal, p.distance, t)) {
+            hit.hit = true;
+            hit.t = t;
+            hit.position = ray.origin + t * ray.direction;
+            hit.normal = normal;
+            hit.primitiveType = PRIMITIVE_PLANE;
+            hit.materialIndex = i;
+            hit.uv = computePlaneUV(hit.position, normal, pc.planeTileScale);
+        }
+    }
+
+    // Mesh instances with BVH
+    for (uint instIdx = 0; instIdx < pc.instanceCount; instIdx++) {
+        MeshInstance inst = instances[instIdx];
+        if (inst.visible == 0) continue;
+        Ray localRay;
+        float dirScale = transformRayToObjectSpace(ray, inst.invTransform, localRay);
+        traverseBVH(localRay, dirScale, hit, instIdx, inst.transform, inst.invTransform, inst.meshId);
+    }
+
+    // Fallback: direct triangle testing if no instances
+    if (pc.instanceCount == 0) {
+        for (uint i = 0; i < pc.triangleCount; i++) {
+            Triangle tri = triangles[i];
+            vec3 v0 = getVertexPosition(vertices[tri.indices[0]]);
+            vec3 v1 = getVertexPosition(vertices[tri.indices[1]]);
+            vec3 v2 = getVertexPosition(vertices[tri.indices[2]]);
+
+            float t = hit.t;
+            vec3 bary;
+            if (intersectTriangle(ray, v0, v1, v2, t, bary)) {
+                hit.hit = true;
+                hit.t = t;
+                hit.position = ray.origin + t * ray.direction;
+                vec3 n0 = getVertexNormal(vertices[tri.indices[0]]);
+                vec3 n1 = getVertexNormal(vertices[tri.indices[1]]);
+                vec3 n2 = getVertexNormal(vertices[tri.indices[2]]);
+                hit.normal = normalize(bary.x * n0 + bary.y * n1 + bary.z * n2);
+                vec2 uv0 = getVertexTexCoord(vertices[tri.indices[0]]);
+                vec2 uv1 = getVertexTexCoord(vertices[tri.indices[1]]);
+                vec2 uv2 = getVertexTexCoord(vertices[tri.indices[2]]);
+                hit.uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+                hit.primitiveType = PRIMITIVE_TRIANGLE;
+                hit.triangleIndex = i;
+                hit.materialIndex = tri.materialIndex;
+            }
+        }
+    }
+
+    return hit;
+}
+
+// Shadow ray test - returns true if point is in shadow
+bool isInShadow(vec3 position, vec3 normal, vec3 lightDir, float maxDist, int skipInstance) {
+    Ray shadowRay;
+    shadowRay.origin = position + normal * SHADOW_BIAS + lightDir * SHADOW_BIAS;
+    shadowRay.direction = lightDir;
+
+    // Test spheres
+    for (uint i = 0; i < pc.sphereCount; i++) {
+        Sphere s = spheres[i];
+        vec3 center = vec3(s.center_x, s.center_y, s.center_z);
+        float t = maxDist;
+        if (intersectSphere(shadowRay, center, s.radius, t)) return true;
+    }
+
+    // Test mesh instances using unified BVH any-hit
+    for (uint instIdx = 0; instIdx < pc.instanceCount; instIdx++) {
+        if (int(instIdx) == skipInstance) continue;
+        MeshInstance inst = instances[instIdx];
+        if (inst.visible == 0) continue;
+        Ray localRay;
+        float dirScale = transformRayToObjectSpace(shadowRay, inst.invTransform, localRay);
+        // Convert world maxDist to local space for comparison
+        if (traverseBVHAnyHit(localRay, maxDist * dirScale, inst.meshId)) return true;
+    }
+
+    return false;
+}
+
+// ==================== Light Evaluation (Unified) ====================
+
+// Evaluate a light source at a given position
+LightSample evaluateLight(Light light, vec3 position) {
+    LightSample ls;
+    ls.valid = true;
+    ls.attenuation = 1.0;
+    ls.maxDist = MAX_DIST;
+
+    vec3 lightPos = vec3(light.position_x, light.position_y, light.position_z);
+    vec3 lightDir = vec3(light.direction_x, light.direction_y, light.direction_z);
+    ls.color = vec3(light.color_r, light.color_g, light.color_b) * light.intensity;
+
+    int lightType = int(light.type);
+    if (lightType == LIGHT_DIRECTIONAL) {
+        ls.direction = normalize(lightDir);
+    } else {
+        // Point or spot light
+        vec3 toLight = lightPos - position;
+        float dist = length(toLight);
+        if (dist < EPSILON) dist = EPSILON;
+        ls.direction = toLight / dist;
+        ls.maxDist = dist;
+        ls.attenuation = 1.0 / (1.0 + dist * dist / (light.range * light.range));
+
+        if (lightType == LIGHT_SPOT) {
+            float spotCos = dot(-ls.direction, normalize(lightDir));
+            float spotAngleCos = cos(light.spotAngle);
+            float spotEdge = cos(light.spotAngle * (1.0 - light.spotSoftness));
+            float spotDenom = spotEdge - spotAngleCos;
+            float spotAtten = (abs(spotDenom) > EPSILON)
+                ? clamp((spotCos - spotAngleCos) / spotDenom, 0.0, 1.0)
+                : (spotCos >= spotAngleCos ? 1.0 : 0.0);
+            ls.attenuation *= spotAtten;
+        }
+    }
+
+    return ls;
+}
+
+// ==================== Texture Sampling ====================
+
+// Sample texture by index, using texture info for offset and dimensions
+vec3 sampleTextureByIndex(vec2 uv, int texIndex) {
+    if (texIndex < 0) return vec3(1.0);  // No texture, return white
+
+    TextureInfo info = textureInfos[texIndex];
+    if (info.width == 0 || info.height == 0) return vec3(1.0);
+
+    uv = fract(uv);
+    float fx = uv.x * float(info.width);
+    float fy = uv.y * float(info.height);
+    int x0 = int(floor(fx)), y0 = int(floor(fy));
+    int x1 = (x0 + 1) % int(info.width);
+    int y1 = (y0 + 1) % int(info.height);
+    float fracX = fract(fx), fracY = fract(fy);
+    int w = int(info.width);
+    uint baseOffset = info.offset;
+
+    vec4 c00 = textureData[baseOffset + y0 * w + x0];
+    vec4 c10 = textureData[baseOffset + y0 * w + x1];
+    vec4 c01 = textureData[baseOffset + y1 * w + x0];
+    vec4 c11 = textureData[baseOffset + y1 * w + x1];
+
+    return mix(mix(c00, c10, fracX), mix(c01, c11, fracX), fracY).rgb;
+}
+
+// Legacy function for backwards compatibility (uses first texture)
+vec3 sampleTexture(vec2 uv) {
+    return sampleTextureByIndex(uv, 0);
+}
+
+// ==================== PBR Functions ====================
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * denom * denom, EPSILON);
+}
+
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness)
+         * geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// ==================== Shading Functions ====================
+
+// Lambert diffuse lighting
+vec3 shadeLambert(vec3 position, vec3 N, vec3 albedo, int skipInstance) {
+    vec3 result = vec3(0.0);
+    for (uint i = 0; i < pc.lightCount; i++) {
+        LightSample ls = evaluateLight(lights[i], position);
+        float NdotL = dot(N, ls.direction);
+        if (NdotL <= 0.0) continue;
+        if (isInShadow(position, N, ls.direction, ls.maxDist, skipInstance)) continue;
+        result += (albedo / PI) * ls.color * ls.attenuation * NdotL;
+    }
+    return result;
+}
+
+// Blinn-Phong lighting
+vec3 shadePhong(vec3 position, vec3 N, vec3 albedo, float shininess, vec3 V, int skipInstance) {
+    vec3 result = vec3(0.0);
+    for (uint i = 0; i < pc.lightCount; i++) {
+        LightSample ls = evaluateLight(lights[i], position);
+        float NdotL = dot(N, ls.direction);
+        if (NdotL <= 0.0) continue;
+
+        vec3 diffuse = albedo * NdotL;
+        vec3 H = normalize(ls.direction + V);
+        vec3 specular = vec3(0.5) * pow(max(dot(N, H), 0.0), shininess);
+
+        result += (diffuse + specular) * ls.color * ls.attenuation;
+    }
+    return result;
+}
+
+// PBR Cook-Torrance lighting
+vec3 shadePBR(vec3 position, vec3 N, vec3 albedo, float metallic, float roughness, vec3 V, int skipInstance) {
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 result = vec3(0.0);
+
+    for (uint i = 0; i < pc.lightCount; i++) {
+        LightSample ls = evaluateLight(lights[i], position);
+        float NdotL = max(dot(N, ls.direction), 0.0);
+        if (NdotL <= 0.0) continue;
+        if (isInShadow(position, N, ls.direction, ls.maxDist, skipInstance)) continue;
+
+        vec3 H = normalize(V + ls.direction);
+        float D = distributionGGX(N, H, roughness);
+        float G = geometrySmith(N, V, ls.direction, roughness);
+        vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+        vec3 specular = (D * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdotL, EPSILON);
+        vec3 kD = (1.0 - F) * (1.0 - metallic);
+        vec3 radiance = ls.color * ls.attenuation;
+
+        result += (kD * albedo / PI + specular) * radiance * NdotL;
+    }
+    return result;
+}
+
+// ==================== Surface Properties ====================
+
+SurfaceInfo getSurfaceInfo(HitInfo hit) {
+    SurfaceInfo surf;
+    surf.albedo = vec3(1.0);
+    surf.metallic = 0.0;
+    surf.roughness = 0.5;
+    surf.reflectivity = 0.0;
+    surf.shadingMode = SHADING_PBR;
+    surf.skipInstance = -1;
+
+    if (hit.primitiveType == PRIMITIVE_SPHERE) {
+        Sphere s = spheres[hit.materialIndex];
+        surf.albedo = vec3(s.color_r, s.color_g, s.color_b);
+        surf.roughness = 1.0 - (s.shininess / 128.0);
+        surf.metallic = s.reflectivity;
+        surf.reflectivity = s.reflectivity;
+        surf.shadingMode = s.shadingMode;
+    } else if (hit.primitiveType == PRIMITIVE_PLANE) {
+        Plane p = planes[hit.materialIndex];
+        surf.albedo = vec3(p.color_r, p.color_g, p.color_b);
+        surf.roughness = 0.8;
+        surf.metallic = p.reflectivity * 0.5;
+        surf.reflectivity = p.reflectivity;
+        surf.shadingMode = p.shadingMode;
+    } else {
+        // Triangle mesh
+        surf.skipInstance = int(hit.instanceIndex);
+        if (hit.materialIndex < pc.materialCount) {
+            Material mat = materials[hit.materialIndex];
+            vec3 texColor = sampleTextureByIndex(hit.uv, mat.diffuseTextureIndex);
+            vec3 matDiffuse = vec3(mat.diffuse_r, mat.diffuse_g, mat.diffuse_b);
+            surf.albedo = texColor * matDiffuse;
+            surf.roughness = 1.0 - (mat.shininess / 128.0);
+            surf.reflectivity = 0.1;
+            surf.shadingMode = mat.shadingMode;
+        } else {
+            surf.albedo = sampleTextureByIndex(hit.uv, 0);  // Fallback to first texture
+            surf.reflectivity = 0.1;
+        }
+    }
+    return surf;
+}
+
+// Compute direct lighting using appropriate shading model
+vec3 computeDirectLighting(HitInfo hit, SurfaceInfo surf, vec3 viewDir) {
+    if (surf.shadingMode == SHADING_FLAT) return surf.albedo;
+    if (pc.lightCount == 0) {
+        // Fallback simple directional
+        vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
+        return surf.albedo * max(dot(hit.normal, lightDir), 0.0);
+    }
+
+    vec3 V = -viewDir;
+    if (surf.shadingMode == SHADING_LAMBERT) {
+        return shadeLambert(hit.position, hit.normal, surf.albedo, surf.skipInstance);
+    } else if (surf.shadingMode == SHADING_PHONG) {
+        return shadePhong(hit.position, hit.normal, surf.albedo, 32.0, V, surf.skipInstance);
+    } else {
+        return shadePBR(hit.position, hit.normal, surf.albedo, surf.metallic, surf.roughness, V, surf.skipInstance);
+    }
+}
+
+// Sky color gradient
+vec3 getSkyColor(vec3 direction) {
+    float t = clamp(0.5 * (direction.y + 1.0), 0.0, 1.0);
+    return mix(vec3(1.0), vec3(0.5, 0.7, 1.0), t);
+}
+
+// ==================== Main ====================
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(outputImage);
+    if (pixelCoords.x >= dims.x || pixelCoords.y >= dims.y) return;
+
+    Ray ray = generateCameraRay(pixelCoords, dims);
+    vec3 accumulatedColor = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    uint maxBounces = max(pc.maxBounces, 1u);
+
+    for (uint bounce = 0; bounce < maxBounces; bounce++) {
+        HitInfo hit = traceScene(ray);
+
+        if (!hit.hit) {
+            accumulatedColor += throughput * getSkyColor(ray.direction);
+            break;
+        }
+
+        SurfaceInfo surf = getSurfaceInfo(hit);
+        vec3 ambient = 0.03 * surf.albedo;
+        vec3 directLight = computeDirectLighting(hit, surf, ray.direction);
+        accumulatedColor += throughput * (ambient + directLight);
+
+        // Continue only if reflective enough
+        if (surf.reflectivity < 0.01) break;
+
+        // Setup reflection ray
+        ray.origin = hit.position + hit.normal * SHADOW_BIAS;
+        ray.direction = normalize(reflect(ray.direction, hit.normal));
+
+        // Attenuate throughput
+        vec3 reflectColor = mix(vec3(1.0), surf.albedo, surf.metallic);
+        throughput *= surf.reflectivity * reflectColor;
+
+        if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) break;
+    }
+
+    imageStore(outputImage, pixelCoords, vec4(accumulatedColor, 1.0));
+}

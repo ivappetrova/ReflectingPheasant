@@ -1,0 +1,47 @@
+/* Side navigation improvements */
+.md-nav--primary .md-nav__title {
+    font-weight: 700;
+}
+
+/* Better code block styling */
+.highlight code {
+    font-size: 0.85em;
+}
+
+/* Table of contents on the right */
+.md-sidebar--secondary {
+    order: 2;
+}
+
+/* Quick links grid for section index */
+.quick-links {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+.quick-links a {
+    display: block;
+    padding: 1rem;
+    border: 1px solid var(--md-default-fg-color--lightest);
+    border-radius: 4px;
+    text-decoration: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.quick-links a:hover {
+    border-color: var(--md-accent-fg-color);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.quick-links a strong {
+    display: block;
+    color: var(--md-accent-fg-color);
+    margin-bottom: 0.25rem;
+}
+
+.quick-links a span {
+    font-size: 0.875rem;
+    color: var(--md-default-fg-color--light);
+}

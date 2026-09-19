@@ -1,0 +1,60 @@
+# Build directories
+build*/
+cmake-build-*/
+site/
+bin/
+lib/
+
+external/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Visual Studio files
+.vs/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+FlyTracer
+
+# Shader compiled files (optional - you might want to commit these)
+# *.spv
+
+# OS files
+.DS_Store
+Thumbs.db
